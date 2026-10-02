@@ -237,7 +237,8 @@ fn build_data_sink(
         )?));
     }
 
-    if config.sinks.tracing.is_enabled()
+    if config.sinks.prometheus.is_enabled()
+        || config.sinks.tracing.is_enabled()
         || config.sinks.health_report.is_enabled()
         || config.sinks.power_shelf_health_report.is_enabled()
         || config.sinks.switch_health_report.is_enabled()

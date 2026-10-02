@@ -16,12 +16,17 @@
  */
 
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use dashmap::DashMap;
+use prometheus::{GaugeVec, IntCounterVec, Opts};
 
-use super::{CollectorEvent, DataSink, EventContext, MetricSample};
+use super::{
+    Classification, CollectorEvent, DataSink, EventContext, HealthReport, HealthReportTarget,
+    MetricSample, ReportSource,
+};
 use crate::HealthError;
 use crate::metrics::{CollectorRegistry, GaugeMetrics, GaugeReading, MetricsManager};
 
@@ -34,6 +39,109 @@ use crate::metrics::{CollectorRegistry, GaugeMetrics, GaugeReading, MetricsManag
 pub struct PrometheusSink {
     collector_registry: Arc<CollectorRegistry>,
     stream_metrics: DashMap<String, DashMap<&'static str, Arc<GaugeMetrics>>>,
+    component_health: ComponentHealthMetrics,
+    component_states: Mutex<HashMap<String, ComponentHealthState>>,
+}
+
+const COMPONENT_LABELS: [&str; 8] = [
+    "rack_id",
+    "nvl_domain",
+    "subsystem",
+    "component_type",
+    "component_uid",
+    "rack_position",
+    "tray_index",
+    "slot_number",
+];
+
+#[derive(Clone)]
+struct ComponentHealthMetrics {
+    state: GaugeVec,
+    observed_time_seconds: GaugeVec,
+    unresolved_alerts: GaugeVec,
+    remediation_action: GaugeVec,
+    transitions_total: IntCounterVec,
+}
+
+#[derive(Clone, Debug)]
+struct SourceHealthState {
+    state: u8,
+    unresolved_alerts: usize,
+    actions: HashSet<(&'static str, &'static str)>,
+    observed_time_seconds: f64,
+}
+
+#[derive(Default)]
+struct ComponentHealthState {
+    sources: HashMap<ReportSource, SourceHealthState>,
+    aggregate_state: Option<u8>,
+    active_actions: HashSet<(&'static str, &'static str)>,
+}
+
+struct ComponentIdentity {
+    key: String,
+    labels: [String; COMPONENT_LABELS.len()],
+}
+
+impl ComponentHealthMetrics {
+    fn new(registry: &prometheus::Registry, prefix: &str) -> Result<Self, prometheus::Error> {
+        let state = GaugeVec::new(
+            Opts::new(
+                format!("{prefix}_component_health_state"),
+                "Current component health derived from structured health reports: 0 unknown, 1 healthy, 2 warning, 3 degraded, 4 critical.",
+            ),
+            &COMPONENT_LABELS,
+        )?;
+        registry.register(Box::new(state.clone()))?;
+
+        let observed_time_seconds = GaugeVec::new(
+            Opts::new(
+                format!("{prefix}_component_health_observed_time_seconds"),
+                "Unix timestamp of the newest structured health report contributing to component health.",
+            ),
+            &COMPONENT_LABELS,
+        )?;
+        registry.register(Box::new(observed_time_seconds.clone()))?;
+
+        let unresolved_alerts = GaugeVec::new(
+            Opts::new(
+                format!("{prefix}_component_unresolved_alerts"),
+                "Current structured health-report alerts for the component.",
+            ),
+            &COMPONENT_LABELS,
+        )?;
+        registry.register(Box::new(unresolved_alerts.clone()))?;
+
+        let mut remediation_labels = COMPONENT_LABELS.to_vec();
+        remediation_labels.extend(["action_code", "severity"]);
+        let remediation_action = GaugeVec::new(
+            Opts::new(
+                format!("{prefix}_component_remediation_action"),
+                "Bounded remediation actions derived from active structured health-report classifications; 1 means active.",
+            ),
+            &remediation_labels,
+        )?;
+        registry.register(Box::new(remediation_action.clone()))?;
+
+        let mut transition_labels = COMPONENT_LABELS.to_vec();
+        transition_labels.extend(["transition", "severity"]);
+        let transitions_total = IntCounterVec::new(
+            Opts::new(
+                format!("{prefix}_component_health_transitions_total"),
+                "Component semantic health transitions observed by this Hardware Health process.",
+            ),
+            &transition_labels,
+        )?;
+        registry.register(Box::new(transitions_total.clone()))?;
+
+        Ok(Self {
+            state,
+            observed_time_seconds,
+            unresolved_alerts,
+            remediation_action,
+            transitions_total,
+        })
+    }
 }
 
 impl PrometheusSink {
@@ -45,10 +153,271 @@ impl PrometheusSink {
             "sink_prometheus_collector".to_string(),
             metrics_prefix,
         )?);
+        let component_health =
+            ComponentHealthMetrics::new(metrics_manager.global_registry(), metrics_prefix)?;
         Ok(Self {
             collector_registry,
             stream_metrics: DashMap::new(),
+            component_health,
+            component_states: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn component_identity(context: &EventContext) -> Option<ComponentIdentity> {
+        let target = context.health_report_target()?;
+        let rack_id = context.rack_id()?.to_string();
+        let (subsystem, component_type, component_uid, rack_position, tray_index, slot_number) =
+            match target {
+                HealthReportTarget::Machine => {
+                    let component_uid = context
+                        .machine_id()
+                        .map(|id| id.to_string())
+                        .or_else(|| context.system_uuid().map(|id| id.to_string()))
+                        .or_else(|| context.machine_serial().map(str::to_string))
+                        .unwrap_or_else(|| context.endpoint_key().to_string());
+                    let tray_index = context.tray_index().map(|value| value.to_string());
+                    (
+                        "compute",
+                        "compute_node",
+                        component_uid,
+                        tray_index
+                            .as_deref()
+                            .map_or_else(String::new, |tray| format!("compute_tray_{tray:0>2}")),
+                        tray_index.unwrap_or_default(),
+                        context
+                            .slot_number()
+                            .map_or_else(String::new, |value| value.to_string()),
+                    )
+                }
+                HealthReportTarget::PowerShelf => {
+                    let component_uid = context
+                        .power_shelf_id()
+                        .map(|id| id.to_string())
+                        .or_else(|| context.serial_number().map(str::to_string))
+                        .unwrap_or_else(|| context.endpoint_key().to_string());
+                    (
+                        "power",
+                        "power_shelf",
+                        component_uid,
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    )
+                }
+                HealthReportTarget::Switch => {
+                    let component_uid = context
+                        .switch_id()
+                        .map(|id| id.to_string())
+                        .or_else(|| context.switch_serial().map(str::to_string))
+                        .unwrap_or_else(|| context.endpoint_key().to_string());
+                    let tray_index = context.switch_tray_index().map(|value| value.to_string());
+                    (
+                        "switch",
+                        "nvlink_switch",
+                        component_uid,
+                        tray_index
+                            .as_deref()
+                            .map_or_else(String::new, |tray| format!("nvlink_switch_{tray:0>2}")),
+                        tray_index.unwrap_or_default(),
+                        context
+                            .switch_slot_number()
+                            .map_or_else(String::new, |value| value.to_string()),
+                    )
+                }
+                HealthReportTarget::NvLinkDomain | HealthReportTarget::Rack => return None,
+            };
+
+        let nvl_domain = context
+            .nvlink_domain_uuid()
+            .map_or_else(String::new, |id| id.to_string());
+        let key = format!("{rack_id}::{component_type}::{component_uid}");
+
+        Some(ComponentIdentity {
+            key,
+            labels: [
+                rack_id,
+                nvl_domain,
+                subsystem.to_string(),
+                component_type.to_string(),
+                component_uid,
+                rack_position,
+                tray_index,
+                slot_number,
+            ],
+        })
+    }
+
+    fn report_state(report: &HealthReport) -> SourceHealthState {
+        let mut state = if report.successes.is_empty() { 0 } else { 1 };
+        let mut actions = HashSet::new();
+
+        for alert in &report.alerts {
+            if alert.classifications.is_empty() {
+                state = state.max(3);
+                actions.insert(("INSPECT_HARDWARE_ALERT", "degraded"));
+            }
+            for classification in &alert.classifications {
+                let (candidate_state, candidate_action, candidate_severity) =
+                    Self::classification_state(*classification);
+                state = state.max(candidate_state);
+                if candidate_state > 1 {
+                    actions.insert((candidate_action, candidate_severity));
+                }
+            }
+        }
+
+        let observed_time_seconds = report.observed_at.map_or_else(
+            || chrono::Utc::now().timestamp() as f64,
+            |observed_at| observed_at.timestamp_millis() as f64 / 1_000.0,
+        );
+        SourceHealthState {
+            state,
+            unresolved_alerts: report.alerts.len(),
+            actions,
+            observed_time_seconds,
+        }
+    }
+
+    fn classification_state(classification: Classification) -> (u8, &'static str, &'static str) {
+        match classification {
+            Classification::SensorOk => (1, "NONE", "healthy"),
+            Classification::SensorWarning => (2, "INSPECT_SENSOR", "warning"),
+            Classification::SensorFailure => (3, "CHECK_SENSOR_TELEMETRY", "degraded"),
+            Classification::SensorCritical | Classification::SensorFatal => {
+                (4, "STOP_AND_INSPECT_SENSOR", "critical")
+            }
+            Classification::PreventAllocations => (4, "PREVENT_ALLOCATIONS", "critical"),
+            Classification::Leak => (4, "STOP_AND_INSPECT_LEAK", "critical"),
+            Classification::LeakDetector => (3, "INSPECT_LEAK_DETECTOR", "degraded"),
+        }
+    }
+
+    fn record_health_report(
+        &self,
+        context: &EventContext,
+        report: &HealthReport,
+    ) -> Result<(), HealthError> {
+        // Collectors without sensor-health context can produce an empty
+        // BmcSensors report at the end of a metric window. Absence of evidence
+        // is not a semantic state and must not overwrite a prior real report.
+        if report.is_empty() || report.target != context.health_report_target() {
+            return Ok(());
+        }
+        let Some(identity) = Self::component_identity(context) else {
+            return Ok(());
+        };
+        let report_state = Self::report_state(report);
+        let label_values = identity
+            .labels
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let mut states = self.component_states.lock().map_err(|_| {
+            HealthError::GenericError("component health state lock was poisoned".to_string())
+        })?;
+        let component = states.entry(identity.key).or_default();
+        component.sources.insert(report.source, report_state);
+
+        let aggregate_state =
+            Self::aggregate_source_state(component.sources.values().map(|source| source.state));
+        let unresolved_alerts = component
+            .sources
+            .values()
+            .map(|source| source.unresolved_alerts)
+            .sum::<usize>();
+        let observed_time_seconds = component
+            .sources
+            .values()
+            .map(|source| source.observed_time_seconds)
+            .fold(0.0, f64::max);
+
+        self.component_health
+            .state
+            .with_label_values(&label_values)
+            .set(f64::from(aggregate_state));
+        self.component_health
+            .observed_time_seconds
+            .with_label_values(&label_values)
+            .set(observed_time_seconds);
+        self.component_health
+            .unresolved_alerts
+            .with_label_values(&label_values)
+            .set(unresolved_alerts as f64);
+
+        let current_actions = component
+            .sources
+            .values()
+            .flat_map(|source| source.actions.iter().copied())
+            .collect::<HashSet<_>>();
+        for (action_code, severity) in component.active_actions.difference(&current_actions) {
+            let mut values = label_values.clone();
+            values.extend([*action_code, *severity]);
+            self.component_health
+                .remediation_action
+                .with_label_values(&values)
+                .set(0.0);
+        }
+        for (action_code, severity) in &current_actions {
+            let mut values = label_values.clone();
+            values.extend([*action_code, *severity]);
+            self.component_health
+                .remediation_action
+                .with_label_values(&values)
+                .set(1.0);
+        }
+        component.active_actions = current_actions;
+
+        let previous = component.aggregate_state.unwrap_or(0);
+        let transition = if aggregate_state > 1 && aggregate_state > previous {
+            Some("degraded")
+        } else if previous > 1 && aggregate_state <= 1 {
+            Some("recovered")
+        } else {
+            None
+        };
+        if let Some(transition) = transition {
+            let severity = Self::state_severity(aggregate_state);
+            let mut values = label_values;
+            values.extend([transition, severity]);
+            self.component_health
+                .transitions_total
+                .with_label_values(&values)
+                .inc();
+        }
+        component.aggregate_state = Some(aggregate_state);
+        Ok(())
+    }
+
+    fn state_severity(state: u8) -> &'static str {
+        match state {
+            1 => "healthy",
+            2 => "warning",
+            3 => "degraded",
+            4 => "critical",
+            _ => "unknown",
+        }
+    }
+
+    fn aggregate_source_state(states: impl IntoIterator<Item = u8>) -> u8 {
+        let mut saw_healthy = false;
+        let mut saw_unknown = false;
+        let mut worst_problem = 0;
+        for state in states {
+            match state {
+                0 => saw_unknown = true,
+                1 => saw_healthy = true,
+                problem => worst_problem = worst_problem.max(problem),
+            }
+        }
+        if worst_problem > 1 {
+            worst_problem
+        } else if saw_unknown {
+            0
+        } else if saw_healthy {
+            1
+        } else {
+            0
+        }
     }
 
     fn sanitize_id(value: &str) -> String {
@@ -390,9 +759,10 @@ impl DataSink for PrometheusSink {
                 }
             }
             CollectorEvent::CollectorRemoved => return self.remove_collector_metrics(context),
-            CollectorEvent::Log(_)
-            | CollectorEvent::Firmware(_)
-            | CollectorEvent::HealthReport(_) => {}
+            CollectorEvent::HealthReport(report) => {
+                self.record_health_report(context, report)?;
+            }
+            CollectorEvent::Log(_) | CollectorEvent::Firmware(_) => {}
         }
 
         Ok(())
@@ -407,13 +777,14 @@ mod tests {
     use carbide_uuid::power_shelf::PowerShelfId;
     use carbide_uuid::rack::RackId;
     use carbide_uuid::switch::{SwitchId, SwitchIdSource, SwitchType};
+    use chrono::TimeZone;
     use mac_address::MacAddress;
 
     use super::*;
     use crate::endpoint::{
         BmcAddr, EndpointMetadata, MachineData, PowerShelfData, SwitchData, SwitchEndpointRole,
     };
-    use crate::sink::CompositeDataSink;
+    use crate::sink::{CompositeDataSink, HealthReportAlert, HealthReportSuccess, Probe};
 
     fn test_switch_id(label: &str) -> SwitchId {
         let mut hash = [0u8; 32];
@@ -802,5 +1173,101 @@ mod tests {
 
         assert_eq!(exposition.matches("interface_name=\"live\"").count(), 1);
         assert!(exposition.contains("interface_name=\"other\""));
+    }
+
+    #[test]
+    fn aggregate_source_state_preserves_unknown_precedence() {
+        for (scenario, states, expected) in [
+            ("no reports", vec![], 0),
+            ("explicit success", vec![1], 1),
+            ("unknown overrides healthy", vec![1, 0], 0),
+            ("warning overrides unknown", vec![0, 2], 2),
+            ("critical is worst", vec![1, 2, 4, 3], 4),
+        ] {
+            assert_eq!(
+                PrometheusSink::aggregate_source_state(states),
+                expected,
+                "{scenario}"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_reports_emit_component_state_and_bounded_remediation() {
+        let metrics_manager =
+            Arc::new(MetricsManager::new("test_health").expect("should create metrics manager"));
+        let sink = PrometheusSink::new(metrics_manager.clone(), "test_health")
+            .expect("sink should initialize");
+        let context = EventContext {
+            endpoint_key: "42:9e:b1:bd:9d:dd".to_string(),
+            addr: BmcAddr {
+                ip: "10.0.0.1".parse().expect("valid ip"),
+                port: Some(443),
+                mac: Some(MacAddress::from_str("42:9e:b1:bd:9d:dd").expect("valid mac")),
+            },
+            collector_type: "sensor_collector",
+            labels: Default::default(),
+            metadata: Some(EndpointMetadata::Machine(MachineData {
+                machine_id: Some(
+                    "fm100htjtiaehv1n5vh67tbmqq4eabcjdng40f7jupsadbedhruh6rag1l0"
+                        .parse()
+                        .expect("valid machine id"),
+                ),
+                machine_serial: Some("MN-001".to_string()),
+                system_uuid: None.into(),
+                slot_number: Some(20),
+                tray_index: Some(10),
+                nvlink_domain_uuid: Some(NvLinkDomainId::nil()),
+                driver_version: None,
+            })),
+            rack_id: Some(RackId::new("RACK_1")),
+        };
+        let observed_at = chrono::Utc
+            .with_ymd_and_hms(2026, 9, 15, 12, 0, 0)
+            .single()
+            .expect("valid timestamp");
+        let alert = HealthReport {
+            source: ReportSource::BmcSensors,
+            target: Some(HealthReportTarget::Machine),
+            observed_at: Some(observed_at),
+            successes: vec![],
+            alerts: vec![HealthReportAlert {
+                probe_id: Probe::Sensor,
+                target: Some("ASIC_TEMP".to_string()),
+                message: "temperature exceeds threshold".to_string(),
+                classifications: vec![Classification::SensorCritical],
+                attribution: None,
+            }],
+        };
+        sink.handle_event(&context, &CollectorEvent::HealthReport(Arc::new(alert)));
+
+        let alert_metrics = metrics_manager
+            .export_metrics()
+            .expect("service metrics export should work");
+        assert!(alert_metrics.contains("test_health_component_health_state"));
+        assert!(alert_metrics.contains("rack_position=\"compute_tray_10\""));
+        assert!(alert_metrics.contains("slot_number=\"20\""));
+        assert!(alert_metrics.contains("action_code=\"STOP_AND_INSPECT_SENSOR\""));
+        assert!(alert_metrics.contains("} 4"));
+
+        let recovered = HealthReport {
+            source: ReportSource::BmcSensors,
+            target: Some(HealthReportTarget::Machine),
+            observed_at: Some(observed_at + chrono::Duration::seconds(30)),
+            successes: vec![HealthReportSuccess {
+                probe_id: Probe::Sensor,
+                target: Some("ASIC_TEMP".to_string()),
+                attribution: None,
+            }],
+            alerts: vec![],
+        };
+        sink.handle_event(&context, &CollectorEvent::HealthReport(Arc::new(recovered)));
+
+        let recovered_metrics = metrics_manager
+            .export_metrics()
+            .expect("service metrics export should work");
+        assert!(recovered_metrics.contains("transition=\"recovered\""));
+        assert!(recovered_metrics.contains("action_code=\"STOP_AND_INSPECT_SENSOR\""));
+        assert!(recovered_metrics.contains("} 0"));
     }
 }

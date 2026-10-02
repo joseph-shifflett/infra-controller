@@ -67,6 +67,11 @@ The expected results are:
 - `/livez` returns `ok`. This proves that the HTTP listener is running; it
   does not prove that a BMC collection succeeded.
 - `/metrics` contains service-level discovery, collector, and process metrics.
+  When the Prometheus sink receives a non-empty structured health report, it
+  also exposes `carbide_hardware_health_component_health_state`, its source
+  observation time, unresolved-alert count, bounded active remediation action
+  codes, and semantic transition counters. Empty reports never imply healthy
+  or overwrite prior evidence.
 - `/telemetry` contains per-sensor gauges after the first discovery and sensor
   collection pass. The default sensor poll interval is 60 seconds.
 
